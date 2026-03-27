@@ -181,14 +181,28 @@ def _inject_via_com(
         new_mod.CodeModule.AddFromString(vba_code)
         logger.info(f"Injected VBA module '{module_name}' ({len(vba_code)} chars)")
 
-        # Save in the appropriate format
-        wb.SaveAs(str(out), FileFormat=xl_format)
-        logger.info(f"Saved workbook as {out.name} (format {xl_format})")
+        # SaveAs fails if the destination already exists (COM does not overwrite).
+        # Save to a clean temp path first, then move to the final destination.
+        tmp_fd, tmp_path_str = tempfile.mkstemp(suffix=correct_ext)
+        os.close(tmp_fd)
+        tmp_path = Path(tmp_path_str)
+
+        try:
+            wb.SaveAs(str(tmp_path), FileFormat=xl_format)
+            logger.info(f"Saved workbook to temp: {tmp_path.name} (format {xl_format})")
+        except Exception as save_exc:
+            tmp_path.unlink(missing_ok=True)
+            raise save_exc
 
         wb.Close(SaveChanges=False)
         wb = None
         excel.Quit()
         excel = None
+
+        # Move temp file to final destination
+        if out.exists():
+            out.unlink()
+        shutil.move(str(tmp_path), str(out))
 
         if not out.exists():
             return False, "Excel saved cleanly but output file not found on disk"
