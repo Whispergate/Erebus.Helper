@@ -1341,7 +1341,7 @@ def main():
 
     parser.add_argument(
         '--sign-cert',
-        help='Optional .pfx cert path — if provided, electron-builder signs the NSIS output'
+        help='Optional .pfx cert path - if provided, electron-builder signs the NSIS output'
     )
 
     parser.add_argument(

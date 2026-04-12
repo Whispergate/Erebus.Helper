@@ -1,5 +1,5 @@
 """
-Erebus.Helper — Windows-side Electron fake-installer container build.
+Erebus.Helper - Windows-side Electron fake-installer container build.
 
 Invoked by the deferred build runbook (build_electron.bat) produced by the
 Linux builder. Runs npm install, then electron-builder to produce the
@@ -114,7 +114,7 @@ def compile_electron(
         if sign_password:
             env["CSC_KEY_PASSWORD"] = sign_password
     else:
-        # Skip signing — electron-builder would otherwise probe the Windows cert store.
+        # Skip signing - electron-builder would otherwise probe the Windows cert store.
         env["CSC_IDENTITY_AUTO_DISCOVERY"] = "false"
 
     # Step 1: npm install
@@ -124,7 +124,7 @@ def compile_electron(
             return False, f"npm install failed ({rc}): {err.strip() or _out.strip()}"
 
     # Step 2: electron-builder produces the NSIS installer.
-    # No native addon rebuild needed — the Electron container is pure JS
+    # No native addon rebuild needed - the Electron container is pure JS
     # (fake-installer wizard that extract-and-spawns the embedded loader).
     arch_flag = f"--{arch}" if arch in ("x64", "ia32") else "--x64"
     rc, _out, err = _run(
