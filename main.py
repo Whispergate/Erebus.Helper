@@ -31,6 +31,7 @@ from typing import Dict, Any, Optional, Tuple
 import logging
 
 from modules.compile_xll import compile_xll, XllCompiler
+from modules.compile_electron import compile_electron
 
 # Setup logging
 logging.basicConfig(
@@ -1138,7 +1139,7 @@ def main():
 
     parser.add_argument(
         'command',
-        choices=['xll', 'dll', 'verify', 'excel', 'xlsx', 'xlsm', 'xlam', 'lnk', 'msi'],
+        choices=['xll', 'dll', 'verify', 'excel', 'xlsx', 'xlsm', 'xlam', 'lnk', 'msi', 'electron'],
         help='Build/create command to execute (xll/dll/verify for compilation, excel/xlsx/xlsm/xlam/lnk/msi for creation)'
     )
 
@@ -1326,6 +1327,28 @@ def main():
         help='Output results as JSON'
     )
 
+    # Arguments for electron deferred build
+    parser.add_argument(
+        '--project-dir',
+        help='Path to the staged Erebus.Electron project directory (required for electron command)'
+    )
+
+    parser.add_argument(
+        '--skip-install',
+        action='store_true',
+        help='Skip `npm install` (assumes node_modules already present)'
+    )
+
+    parser.add_argument(
+        '--sign-cert',
+        help='Optional .pfx cert path — if provided, electron-builder signs the NSIS output'
+    )
+
+    parser.add_argument(
+        '--sign-password',
+        help='Password for --sign-cert (matches CSC_KEY_PASSWORD)'
+    )
+
     args = parser.parse_args()
 
     # Validate arguments based on command
@@ -1348,6 +1371,9 @@ def main():
             parser.error("--msi-file is required for msi command")
         if not args.payload:
             parser.error("--payload is required for msi command")
+    elif args.command == 'electron':
+        if not args.project_dir:
+            parser.error("--project-dir is required for electron command")
 
     # Load config file if it exists
     config_path = Path(__file__).parent / 'config.ini'
@@ -1455,6 +1481,23 @@ def main():
                         logger.warning(f"Failed to hide LNK file: {e}")
             except Exception as e:
                 logger.error(f"LNK creation failed: {e}")
+                success = False
+
+        elif args.command == 'electron':
+            try:
+                ok, msg = compile_electron(
+                    project_dir=args.project_dir,
+                    output_path=args.output,
+                    arch=args.arch,
+                    skip_install=args.skip_install,
+                    sign_cert=args.sign_cert,
+                    sign_password=args.sign_password,
+                )
+                if not ok:
+                    logger.error(f"Electron build failed: {msg}")
+                success = ok
+            except Exception as e:
+                logger.error(f"Electron build failed: {e}")
                 success = False
 
         elif args.command == 'msi':
