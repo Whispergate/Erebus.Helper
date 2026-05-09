@@ -32,6 +32,7 @@ import logging
 
 from modules.compile_xll import compile_xll, XllCompiler
 from modules.compile_electron import compile_electron
+from modules.trigger_chm import compile_chm
 
 # Setup logging
 logging.basicConfig(
@@ -1328,8 +1329,8 @@ def main():
 
     parser.add_argument(
         'command',
-        choices=['xll', 'dll', 'verify', 'excel', 'xlsx', 'xlsm', 'xlam', 'docm', 'doc', 'lnk', 'msi', 'electron'],
-        help='Build/create command to execute (xll/dll/verify for compilation, excel/xlsx/xlsm/xlam/docm/doc/lnk/msi for creation)'
+        choices=['xll', 'dll', 'verify', 'excel', 'xlsx', 'xlsm', 'xlam', 'docm', 'doc', 'lnk', 'msi', 'electron', 'chm'],
+        help='Build/create command to execute (xll/dll/verify for compilation, excel/xlsx/xlsm/xlam/docm/doc/lnk/msi/chm for creation)'
     )
 
     # Common arguments
@@ -1576,6 +1577,9 @@ def main():
     elif args.command == 'electron':
         if not args.project_dir:
             parser.error("--project-dir is required for electron command")
+    elif args.command == 'chm':
+        if not args.project_dir:
+            parser.error("--project-dir is required for chm command")
 
     # Load config file if it exists
     config_path = Path(__file__).parent / 'config.ini'
@@ -1718,6 +1722,21 @@ def main():
                 success = ok
             except Exception as e:
                 logger.error(f"Electron build failed: {e}")
+                success = False
+
+        elif args.command == 'chm':
+            try:
+                ok, msg = compile_chm(
+                    project_dir=args.project_dir,
+                    output_path=args.output,
+                )
+                if not ok:
+                    logger.error(f"CHM compilation failed: {msg}")
+                else:
+                    logger.info(msg)
+                success = ok
+            except Exception as e:
+                logger.error(f"CHM compilation failed: {e}")
                 success = False
 
         elif args.command == 'msi':

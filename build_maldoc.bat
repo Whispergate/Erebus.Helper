@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-:: build_maldoc.bat — Erebus maldoc builder for operator Windows host
+:: build_maldoc.bat - Erebus maldoc builder for operator Windows host
 ::
 :: Usage (run from the payload directory where erebus_payload.bas was dropped):
 ::   build_maldoc.bat [--format <fmt>] [--bas <file>] [--output <file>] [OPTIONS]
