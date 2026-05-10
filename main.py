@@ -4,11 +4,9 @@ Erebus.Helper - Windows Build System
 Handles compilation and creation of platform-specific payloads outside Docker container.
 
 This module manages:
-- XLL (Excel Add-In) DLL compilation
-- Custom DLL payload generation
 - Windows LNK shortcut creation
-- Excel document creation and backdooring
-- Windows-specific tool compilation
+- Excel / Word maldoc creation and backdooring
+- Windows-specific tool compilation (CHM, Electron, MSI)
 
 The Docker container (Linux) generates C/C++ source code and specifications,
 then invokes this helper on the host Windows system to compile/create native artifacts.
@@ -30,7 +28,6 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 import logging
 
-from modules.compile_xll import compile_xll, XllCompiler
 from modules.compile_electron import compile_electron
 from modules.trigger_chm import compile_chm
 
@@ -107,211 +104,6 @@ class WindowsCompiler:
                 return str(Path(result).parent)
 
         return None
-
-    def compile_xll(self, source_file: str, output_file: str, extra_libs: Optional[list] = None) -> bool:
-        """
-        Compile C/C++ source to XLL (Excel Add-In DLL).
-
-        Args:
-            source_file: Path to C/C++ source file
-            output_file: Path where XLL will be saved
-
-        Returns:
-            True if compilation successful, False otherwise
-        """
-        logger.info(f"Compiling XLL from {source_file}")
-
-        if not Path(source_file).exists():
-            logger.error(f"Source file not found: {source_file}")
-            return False
-
-        try:
-            if extra_libs is None:
-                extra_libs = []
-            elif isinstance(extra_libs, str):
-                extra_libs = shlex.split(extra_libs)
-
-            if self.compiler == 'MSVC':
-                return self._compile_msvc(source_file, output_file, extra_libs)
-            elif self.compiler == 'MinGW':
-                return self._compile_mingw(source_file, output_file, extra_libs)
-            elif self.compiler == 'Clang':
-                return self._compile_clang(source_file, output_file, extra_libs)
-        except Exception as e:
-            logger.error(f"Compilation error: {e}")
-            return False
-
-        return False
-
-    def _compile_msvc(self, source_file: str, output_file: str, extra_libs: list) -> bool:
-        """Compile using MSVC (Visual Studio)."""
-        # Find cl.exe
-        cl_exe = None
-
-        if self.compiler_path:
-            # Try to find cl.exe in detected path
-            latest = sorted(Path(self.compiler_path).glob('*/bin/Host*'), reverse=True)
-            if latest:
-                arch_folder = 'x64' if self.architecture == 'x64' else 'x86'
-                cl_exe_path = latest[0] / arch_folder / 'cl.exe'
-                if cl_exe_path.exists():
-                    cl_exe = str(cl_exe_path)
-
-        if not cl_exe:
-            # Try common paths
-            common_paths = [
-                'C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\MSVC',
-                'C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC',
-                'C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Community\\VC\\Tools\\MSVC',
-            ]
-            for base_path in common_paths:
-                latest = sorted(Path(base_path).glob('*/bin/Host*'), reverse=True)
-                if latest:
-                    arch_folder = 'x64' if self.architecture == 'x64' else 'x86'
-                    potential_cl = latest[0] / arch_folder / 'cl.exe'
-                    if potential_cl.exists():
-                        cl_exe = str(potential_cl)
-                        break
-
-        if not cl_exe:
-            cl_exe = shutil.which('cl.exe')
-
-        if not cl_exe:
-            logger.error("cl.exe not found. Install Visual C++ Build Tools.")
-            return False
-
-        logger.info(f"Using cl.exe: {cl_exe}")
-
-        # Build MSVC command
-        cmd = [
-            cl_exe,
-            '/D_WINDOWS',
-            '/DWIN32',
-            '/D_USRDLL',
-            '/D_WINDLL',
-            '/W3',
-            '/nologo',
-            f'/{self.optimization}',
-            '/EHsc',
-            '/LD',
-            f'/Fe{output_file}',
-            source_file
-        ]
-
-        if extra_libs:
-            cmd.extend(extra_libs)
-
-        logger.debug(f"Running: {' '.join(cmd)}")
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-
-            if result.returncode != 0:
-                logger.error(f"Compilation failed:\n{result.stderr}")
-                return False
-
-            if not Path(output_file).exists():
-                logger.error("Output file was not created")
-                return False
-
-            return True
-
-        except subprocess.TimeoutExpired:
-            logger.error("Compilation timed out")
-            return False
-
-    def _compile_mingw(self, source_file: str, output_file: str, extra_libs: list) -> bool:
-        """Compile using MinGW-w64."""
-        gcc_exe = shutil.which('gcc')
-        if not gcc_exe:
-            logger.error("MinGW (gcc) not found in PATH")
-            return False
-
-        logger.info(f"Using gcc: {gcc_exe}")
-
-        arch_flag = '-m64' if self.architecture == 'x64' else '-m32'
-
-        cmd = [
-            gcc_exe,
-            '-shared',
-            '-fPIC',
-            arch_flag,
-            f'-{self.optimization}',
-            '-Wall',
-            '/DWIN32',
-            '/D_WINDOWS',
-            '/D_USRDLL',
-            '-o', output_file,
-            source_file
-        ]
-
-        if extra_libs:
-            cmd.extend(extra_libs)
-
-        logger.debug(f"Running: {' '.join(cmd)}")
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-
-            if result.returncode != 0:
-                logger.error(f"Compilation failed:\n{result.stderr}")
-                return False
-
-            if not Path(output_file).exists():
-                logger.error("Output file was not created")
-                return False
-
-            return True
-
-        except subprocess.TimeoutExpired:
-            logger.error("Compilation timed out")
-            return False
-
-    def _compile_clang(self, source_file: str, output_file: str, extra_libs: list) -> bool:
-        """Compile using Clang."""
-        clang_exe = shutil.which('clang')
-        if not clang_exe:
-            logger.error("Clang not found in PATH")
-            return False
-
-        logger.info(f"Using clang: {clang_exe}")
-
-        arch_flag = '-m64 -target x86_64-pc-windows-msvc' if self.architecture == 'x64' else '-m32 -target i686-pc-windows-msvc'
-
-        cmd = [
-            clang_exe,
-            '-shared',
-            arch_flag.split(),
-            f'-{self.optimization}',
-            '-fPIC',
-            '-Wall',
-            '/DWIN32',
-            '/D_WINDOWS',
-            '-o', output_file,
-            source_file
-        ]
-
-        if extra_libs:
-            cmd.extend(extra_libs)
-
-        logger.debug(f"Running: {' '.join(cmd)}")
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-
-            if result.returncode != 0:
-                logger.error(f"Compilation failed:\n{result.stderr}")
-                return False
-
-            if not Path(output_file).exists():
-                logger.error("Output file was not created")
-                return False
-
-            return True
-
-        except subprocess.TimeoutExpired:
-            logger.error("Compilation timed out")
-            return False
 
     def verify_output(self, output_file: str) -> Tuple[bool, str]:
         """
@@ -1329,8 +1121,8 @@ def main():
 
     parser.add_argument(
         'command',
-        choices=['xll', 'dll', 'verify', 'excel', 'xlsx', 'xlsm', 'xlam', 'docm', 'doc', 'lnk', 'msi', 'electron', 'chm'],
-        help='Build/create command to execute (xll/dll/verify for compilation, excel/xlsx/xlsm/xlam/docm/doc/lnk/msi/chm for creation)'
+        choices=['verify', 'excel', 'xlsx', 'xlsm', 'xlam', 'docm', 'doc', 'lnk', 'msi', 'electron', 'chm'],
+        help='Build/create command to execute'
     )
 
     # Common arguments
@@ -1340,10 +1132,10 @@ def main():
         help='Output path for generated file'
     )
 
-    # Arguments for compilation commands (xll, dll, verify)
+    # Arguments for verify command
     parser.add_argument(
         '--source',
-        help='Path to C/C++ source file (required for compilation)'
+        help='Path to C/C++ source file'
     )
 
     parser.add_argument(
@@ -1552,10 +1344,7 @@ def main():
     args = parser.parse_args()
 
     # Validate arguments based on command
-    if args.command in ['xll', 'dll', 'verify']:
-        if args.command != 'verify' and not args.source:
-            parser.error(f"--source is required for {args.command} command")
-    elif args.command == 'excel':
+    if args.command == 'excel':
         # For excel: --source is input excel or VBA code, --title is workbook title
         pass  # --output is always required
     elif args.command in ('xlsx', 'xlsm', 'xlam'):
@@ -1592,42 +1381,9 @@ def main():
     try:
         success = False
 
-        if args.command in ('xll', 'dll'):
-            # Parse optional extra-flags, defines, and include-dirs
-            extra_flags = shlex.split(args.extra_flags) if args.extra_flags else []
-
-            defines: Dict[str, Any] = {}
-            if args.defines:
-                for token in args.defines.split(','):
-                    token = token.strip()
-                    if '=' in token:
-                        k, v = token.split('=', 1)
-                        defines[k.strip()] = v.strip()
-                    else:
-                        defines[token] = None
-
-            include_dirs = (
-                [d.strip() for d in args.include_dirs.split(';') if d.strip()]
-                if args.include_dirs else []
-            )
-
-            ok, msg = compile_xll(
-                source_file=args.source,
-                output_path=args.output,
-                compiler=args.compiler,
-                architecture=args.arch,
-                optimization=args.optimize,
-                extra_flags=extra_flags,
-                defines=defines,
-                include_dirs=include_dirs,
-                verify=True,
-            )
-            if not ok:
-                logger.error(f"XLL compilation failed: {msg}")
-            success = ok
-
-        elif args.command == 'verify':
-            is_valid, error = XllCompiler.verify_xll(args.output)
+        if args.command == 'verify':
+            wc = WindowsCompiler()
+            is_valid, error = wc.verify_output(args.output)
             success = is_valid
             if not is_valid:
                 logger.error(f"Verification failed: {error}")
@@ -1768,8 +1524,8 @@ def main():
                 'success': success,
                 'command': args.command,
                 'output': str(args.output),
-                'compiler': args.compiler if args.command in ['xll', 'dll'] else 'N/A',
-                'architecture': args.arch if args.command in ['xll', 'dll'] else 'N/A'
+                'compiler': 'N/A',
+                'architecture': args.arch
             }
             print(json.dumps(result, indent=2))
 
