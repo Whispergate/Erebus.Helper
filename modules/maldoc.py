@@ -24,6 +24,7 @@ Fallback:
 
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -45,6 +46,28 @@ _XL_FORMAT_XLSB  = 50   # xlExcel12                      (.xlsb, binary - not us
 _VBA_MODULE_TYPE_STANDARD  = 1   # vbext_ct_StdModule
 _VBA_MODULE_TYPE_CLASS     = 2   # vbext_ct_ClassModule
 _VBA_MODULE_TYPE_DOCUMENT  = 100 # vbext_ct_Document (ThisWorkbook / Sheet)
+
+
+# ============================================================================
+# VBA source sanitiser
+# ============================================================================
+
+def _sanitise_vba(code: str) -> str:
+    """
+    Normalise VBA source before passing to VBE's AddFromString.
+
+    VBE's AddFromString can append a stray '()' placeholder to the module
+    when the code it receives has mixed CRLF/LF line endings.  We normalise
+    to CRLF here so VBE sees a consistent stream, and we strip any lines that
+    are nothing but '()' regardless (they are never valid VBA statements).
+    """
+    # Normalise to CRLF (what VBE expects on Windows)
+    code = code.replace('\r\n', '\n').replace('\r', '\n').replace('\n', '\r\n')
+    # Strip standalone '()' lines — VBE placeholder artifact
+    code = re.sub(r'(?m)^\s*\(\)\s*$', '', code)
+    # Collapse runs of 3+ blank lines that the above substitution can leave
+    code = re.sub(r'(\r\n){3,}', '\r\n\r\n', code)
+    return code.strip() + '\r\n'
 
 
 # ============================================================================
@@ -188,8 +211,22 @@ def _inject_via_com(
         # Add a new standard module and insert the code
         new_mod = components.Add(_VBA_MODULE_TYPE_STANDARD)
         new_mod.Name = module_name
-        new_mod.CodeModule.AddFromString(vba_code)
-        logger.info(f"Injected VBA module '{module_name}' ({len(vba_code)} chars)")
+        clean_code = _sanitise_vba(vba_code)
+        new_mod.CodeModule.AddFromString(clean_code)
+        logger.info(f"Injected VBA module '{module_name}' ({len(clean_code)} chars)")
+
+        # VBE sometimes appends a stray '()' placeholder line after AddFromString.
+        # Remove any trailing lines that are blank or contain only '()'.
+        cm = new_mod.CodeModule
+        try:
+            while cm.CountOfLines > 0:
+                last = cm.Lines(cm.CountOfLines, 1).strip()
+                if last in ('', '()'):
+                    cm.DeleteLines(cm.CountOfLines)
+                else:
+                    break
+        except Exception:
+            pass  # non-fatal; worst case the cosmetic artifact remains
 
         # SaveAs fails if the destination already exists (COM does not overwrite).
         # Save to a clean temp path first, then move to the final destination.
