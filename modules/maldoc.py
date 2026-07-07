@@ -63,7 +63,7 @@ def _sanitise_vba(code: str) -> str:
     """
     # Normalise to CRLF (what VBE expects on Windows)
     code = code.replace('\r\n', '\n').replace('\r', '\n').replace('\n', '\r\n')
-    # Strip standalone '()' lines — VBE placeholder artifact
+    # Strip standalone '()' lines - VBE placeholder artifact
     code = re.sub(r'(?m)^\s*\(\)\s*$', '', code)
     # Collapse runs of 3+ blank lines that the above substitution can leave
     code = re.sub(r'(\r\n){3,}', '\r\n\r\n', code)
